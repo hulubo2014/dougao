@@ -1,5 +1,7 @@
 package com.dougao.app.ui.screens
 
+import android.content.Intent
+import android.net.Uri
 import androidx.compose.animation.*
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
@@ -43,6 +45,7 @@ import androidx.compose.ui.platform.LocalContext
 import com.dougao.app.BuildConfig
 import com.dougao.app.data.ApiProvider
 import com.dougao.app.data.AppSettings
+import com.dougao.app.data.ProjectInfo
 import com.dougao.app.ui.theme.BaoziTheme
 import com.dougao.app.ui.theme.ThemeMode
 import com.dougao.app.utils.CrashHandler
@@ -67,6 +70,7 @@ fun SettingsScreen(
     onManageModels: () -> Unit = {}
 ) {
     val colors = BaoziTheme.colors
+    val context = LocalContext.current
     var showThemeDialog by remember { mutableStateOf(false) }
     var showMaxStepsDialog by remember { mutableStateOf(false) }
     var showShizukuHelpDialog by remember { mutableStateOf(false) }
@@ -533,7 +537,14 @@ fun SettingsScreen(
                 icon = Icons.Default.Build,
                 title = "豆糕 DouGao",
                 subtitle = "手机自动化 + 文件直改的 AI 助手",
-                onClick = { }
+                onClick = {
+                    // 点击跳转到项目开源仓库
+                    runCatching {
+                        context.startActivity(
+                            Intent(Intent.ACTION_VIEW, Uri.parse(ProjectInfo.REPO_URL))
+                        )
+                    }
+                }
             )
         }
 

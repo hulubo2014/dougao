@@ -13,7 +13,7 @@
 [![Kotlin](https://img.shields.io/badge/Kotlin-1.9.20-7F52FF?style=flat-square&logo=kotlin&logoColor=white)](https://kotlinlang.org)
 [![Compose](https://img.shields.io/badge/Compose-Material%203-4285F4?style=flat-square&logo=jetpackcompose&logoColor=white)](https://developer.android.com/jetpack/compose)
 [![minSdk](https://img.shields.io/badge/minSdk-24-orange?style=flat-square)](https://developer.android.com)
-[![License](https://img.shields.io/badge/License-MIT-yellow?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/License-%E7%A6%81%E6%AD%A2%E5%95%86%E7%94%A8-red?style=flat-square)](LICENSE)
 
 </div>
 
@@ -307,18 +307,19 @@ keytool -genkeypair -v -keystore keystore/dougao.jks \
 
 ## 开源协议
 
-本项目基于 [MIT License](LICENSE) 开源。
+本项目采用 **「非商业使用许可协议」（DouGao Non-Commercial License）** 开源，完整条款见 [LICENSE](LICENSE)。
 
-由于基于 `roubao` 二次开发，LICENSE 中保留了原项目的版权声明：
+> ⛔ **禁止商用。** 本项目仅供个人学习、研究、测试与非商业性交流使用。
+> 未经作者书面许可，**不得**将本项目（含源代码、编译产物及其衍生作品）用于任何商业用途 ——
+> 包括但不限于：销售、出租、集成进收费产品或付费服务、用于承载广告/会员/内购/打赏的产品、
+> 企业内部生产经营、以及收费的代做/代运营/培训等。
+>
+> 请勿将本项目上架到任何应用商店或分发平台进行牟利。
 
-```
-MIT License
+由于基于 `roubao` 二次开发，LICENSE 中保留了上游项目的原始版权声明。
+**上游原始代码部分仍受其原有许可约束**（`roubao` 为 MIT License，Copyright (c) 2025 Roubao Team）。
 
-Copyright (c) 2025 Roubao Team   (原项目 roubao)
-Copyright (c) 2026 DouGao Team    (本项目 豆糕)
-```
-
-你可以自由地使用、修改、分发本项目，包括商用，只需保留原始版权声明。
+你可以自由地学习、修改、分发本项目，**前提是保留原始版权声明、完整保留本协议，并且不用于商业用途**。
 
 ---
 
