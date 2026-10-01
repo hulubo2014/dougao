@@ -88,15 +88,42 @@ data class AppSettings(
     // ---- 豆糕新增 ----
     val modelProfiles: List<ModelProfile> = emptyList(),   // 已添加的多个模型
     val activeProfileId: String = "",                      // 当前使用的模型
-    val thinkingLevel: Int = ThinkingLevel.MEDIUM.level,   // 思考程度（低/中/高）
+    val thinkingLevel: Int = ThinkingLevel.LOW.level,      // 思考程度（低/中/高）
+    /**
+     * 极速模式（豆糕 1.2.1 新增）。
+     *
+     * 打开后：
+     *  - 关掉模型的深度思考链（每步不再让模型长篇推理，直接给动作）；
+     *  - 发给模型的截图从 1024 降到 768（上传更小、看图 token 更少）；
+     *  - 动作后的等待时间减半；
+     *  - 上下文只带最近 5 轮。
+     * 综合下来每步能快好几倍。若发现准确率下降，把它关掉即可。
+     */
+    val speedModeEnabled: Boolean = true,
     // ------------------
     val themeMode: ThemeMode = ThemeMode.SYSTEM,
     val hasSeenOnboarding: Boolean = false,
+    /**
+     * 最大执行步数。
+     * **0 表示「不限制」** —— 任务做到模型自己宣布完成为止。
+     */
     val maxSteps: Int = 25,
-    val cloudCrashReportEnabled: Boolean = true,
+    // ---- 高级选项：控制通道（豆糕新增） ----
+    /** 无障碍模式：用系统无障碍服务控屏，不需要 Shizuku */
+    val accessibilityModeEnabled: Boolean = false,
+    /** Shizuku 模式：用 Shizuku shell 控屏 */
+    val shizukuModeEnabled: Boolean = true,
     val rootModeEnabled: Boolean = false,
     val suCommandEnabled: Boolean = false
 ) {
+    /** 步数是否不限 */
+    val unlimitedSteps: Boolean get() = maxSteps <= 0
+
+    /** 界面上展示的步数文案 */
+    val maxStepsLabel: String get() = if (unlimitedSteps) "不限制" else "$maxSteps 步"
+
+    /** 真正传给 Agent 的步数上限 */
+    val effectiveMaxSteps: Int get() = if (unlimitedSteps) Int.MAX_VALUE else maxSteps
     // 便捷属性：获取当前服务商的配置
     val currentConfig: ProviderConfig
         get() = providerConfigs[currentProviderId] ?: ProviderConfig()
@@ -140,7 +167,7 @@ data class AppSettings(
         get() = activeProfile?.providerId ?: currentProviderId
 
     val activeThinking: ThinkingLevel
-        get() = ThinkingLevel.fromLevel(thinkingLevel)
+        get() = if (speedModeEnabled) ThinkingLevel.LOW else ThinkingLevel.fromLevel(thinkingLevel)
 }
 
 /**
@@ -287,11 +314,13 @@ class SettingsManager(context: Context) {
             providerConfigs = providerConfigs,
             modelProfiles = modelProfiles.toList(),
             activeProfileId = activeProfileId,
-            thinkingLevel = prefs.getInt("thinking_level", ThinkingLevel.MEDIUM.level),
+            thinkingLevel = prefs.getInt("thinking_level", ThinkingLevel.LOW.level),
+            speedModeEnabled = prefs.getBoolean("speed_mode_enabled", true),
             themeMode = themeMode,
             hasSeenOnboarding = prefs.getBoolean("has_seen_onboarding", false),
             maxSteps = prefs.getInt("max_steps", 25),
-            cloudCrashReportEnabled = prefs.getBoolean("cloud_crash_report_enabled", true),
+            accessibilityModeEnabled = prefs.getBoolean("accessibility_mode_enabled", false),
+            shizukuModeEnabled = prefs.getBoolean("shizuku_mode_enabled", true),
             rootModeEnabled = prefs.getBoolean("root_mode_enabled", false),
             suCommandEnabled = prefs.getBoolean("su_command_enabled", false)
         )
@@ -407,6 +436,14 @@ class SettingsManager(context: Context) {
     }
 
     /**
+     * 设置「极速模式」开关（豆糕 1.2.1 新增）
+     */
+    fun updateSpeedMode(enabled: Boolean) {
+        prefs.edit().putBoolean("speed_mode_enabled", enabled).apply()
+        _settings.value = _settings.value.copy(speedModeEnabled = enabled)
+    }
+
+    /**
      * 加载指定服务商的配置
      */
     private fun loadProviderConfig(providerId: String): ProviderConfig {
@@ -510,15 +547,26 @@ class SettingsManager(context: Context) {
         _settings.value = _settings.value.copy(hasSeenOnboarding = true)
     }
 
+    /**
+     * 更新最大执行步数。
+     * **0 = 不限制**；其余自动收敛到 5~1000。
+     */
     fun updateMaxSteps(maxSteps: Int) {
-        val validSteps = maxSteps.coerceIn(5, 100) // 限制范围 5-100
+        val validSteps = if (maxSteps <= 0) 0 else maxSteps.coerceIn(5, 1000)
         prefs.edit().putInt("max_steps", validSteps).apply()
         _settings.value = _settings.value.copy(maxSteps = validSteps)
     }
 
-    fun updateCloudCrashReportEnabled(enabled: Boolean) {
-        prefs.edit().putBoolean("cloud_crash_report_enabled", enabled).apply()
-        _settings.value = _settings.value.copy(cloudCrashReportEnabled = enabled)
+    /** 无障碍模式开关 */
+    fun updateAccessibilityModeEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("accessibility_mode_enabled", enabled).apply()
+        _settings.value = _settings.value.copy(accessibilityModeEnabled = enabled)
+    }
+
+    /** Shizuku 模式开关 */
+    fun updateShizukuModeEnabled(enabled: Boolean) {
+        prefs.edit().putBoolean("shizuku_mode_enabled", enabled).apply()
+        _settings.value = _settings.value.copy(shizukuModeEnabled = enabled)
     }
 
     fun updateRootModeEnabled(enabled: Boolean) {

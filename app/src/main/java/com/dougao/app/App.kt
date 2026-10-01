@@ -62,10 +62,10 @@ class App : Application() {
     }
 
     /**
-     * 崩溃上报开关（豆糕版本已移除云端上报，仅保留本地日志）
+     * 崩溃处理：**只写本地日志，永不上报**（云端上报已在豆糕 1.2.0 移除）
      */
-    fun updateCloudCrashReportEnabled(enabled: Boolean) {
-        println("[App] 崩溃日志本地记录: ${if (enabled) "已开启" else "已关闭"}")
+    fun onCrashLogOnly() {
+        println("[App] 崩溃日志仅保存在本地")
     }
 
     companion object {

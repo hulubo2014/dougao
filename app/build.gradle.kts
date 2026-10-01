@@ -28,8 +28,8 @@ android {
         // （Shizuku 依赖库下限为 24，再低会导致运行期崩溃）
         minSdk = 24
         targetSdk = 34
-        versionCode = 10
-        versionName = "1.1.0"
+        versionCode = 15
+        versionName = "1.3.2"
 
         vectorDrawables {
             useSupportLibrary = true

@@ -96,6 +96,9 @@
     <string name="settings_version">版本</string>
     <string name="settings_app_desc">基于视觉语言模型的 Android 自动化工具</string>
 
+    <!-- 无障碍服务 -->
+    <string name="accessibility_service_description">豆糕需要无障碍服务来替代 Shizuku 控制屏幕：派发点击 / 滑动 / 长按手势、读取界面内容、直接输入文字。只在你主动下达任务时工作，不会在后台自动操作。</string>
+
     <!-- Shizuku Status -->
     <string name="shizuku_connected">Shizuku 已连接</string>
     <string name="shizuku_not_connected">Shizuku 未连接</string>

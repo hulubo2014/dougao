@@ -12,6 +12,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -20,6 +21,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Send
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.filled.Menu
+import androidx.compose.material.icons.filled.CheckCircle
+import androidx.compose.material.icons.filled.Warning
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -39,6 +43,8 @@ import androidx.compose.ui.unit.sp
 import com.dougao.app.agent.AgentPhase
 import com.dougao.app.agent.AgentState
 import com.dougao.app.data.ExecutionStep
+import com.dougao.app.data.SessionMessage
+import com.dougao.app.data.TaskSession
 import com.dougao.app.data.ThinkingLevel
 import com.dougao.app.ui.theme.BaoziTheme
 import com.dougao.app.ui.theme.Primary
@@ -70,6 +76,9 @@ fun HomeScreen(
     onExecute: (String) -> Unit,
     onStop: () -> Unit,
     shizukuAvailable: Boolean,
+    accessibilityConnected: Boolean = false,
+    /** 豆糕自己有没有 root 权限（Root 模式已开且授权成功时为 true） */
+    rootAvailable: Boolean = false,
     currentModel: String = "",
     onRefreshShizuku: () -> Unit = {},
     onShizukuRequired: () -> Unit = {},
@@ -78,10 +87,16 @@ fun HomeScreen(
     modelLabel: String = "",
     thinking: ThinkingLevel = ThinkingLevel.MEDIUM,
     onModelClick: () -> Unit = {},
-    onThinkingClick: () -> Unit = {}
+    onThinkingClick: () -> Unit = {},
+    /** 当前所在的任务房间（豆糕 1.3.0）；null = 还没发过消息的新任务 */
+    session: TaskSession? = null,
+    /** 点右上角「三条杠」打开任务抽屉 */
+    onOpenSessions: () -> Unit = {}
 ) {
     val colors = BaoziTheme.colors
     var inputText by remember { mutableStateOf("") }
+    // 无障碍 / Shizuku / Root 任一就绪即可执行
+    val deviceReady = shizukuAvailable || accessibilityConnected || rootAvailable
     val isRunning = isExecuting || agentState?.isRunning == true
     val steps = agentState?.executionSteps ?: emptyList()
     val keyboardController = LocalSoftwareKeyboardController.current
@@ -98,51 +113,73 @@ fun HomeScreen(
         wasRunning = isRunning
     }
 
+    val sessionMessages = session?.messages ?: emptyList()
+    val hasConversation = isRunning || steps.isNotEmpty() || sessionMessages.isNotEmpty()
+
     Column(
         modifier = Modifier
             .fillMaxSize()
             .background(colors.background)
             .imePadding()
     ) {
-        // 顶部标题
-        Box(
+        // ---------------- 顶部标题 ----------------
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 20.dp, vertical = 14.dp)
+                .padding(start = 20.dp, end = 8.dp, top = 14.dp, bottom = 14.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Column {
-                    Text(
-                        text = "豆糕",
-                        fontSize = 26.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = colors.primary
-                    )
-                    Text(
-                        text = if (shizukuAvailable) "准备就绪，告诉我你想做什么" else "请先连接 Shizuku",
-                        fontSize = 13.sp,
-                        color = if (shizukuAvailable) colors.textSecondary else colors.error
-                    )
-                }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "豆糕",
+                    fontSize = 26.sp,
+                    fontWeight = FontWeight.Bold,
+                    color = colors.primary
+                )
+                Text(
+                    text = when {
+                        // 在某个任务房间里时，副标题显示这个房间的名字
+                        session != null && sessionMessages.isNotEmpty() ->
+                            "当前任务：${session.title}"
+                        !deviceReady -> "请先开启无障碍服务或连接 Shizuku"
+                        accessibilityConnected && !shizukuAvailable -> "准备就绪（无障碍模式）"
+                        shizukuAvailable && !accessibilityConnected -> "准备就绪（Shizuku 模式）"
+                        else -> "准备就绪，告诉我你想做什么"
+                    },
+                    fontSize = 13.sp,
+                    color = if (deviceReady) colors.textSecondary else colors.error,
+                    maxLines = 1
+                )
+            }
 
-                if (!shizukuAvailable) {
-                    IconButton(
-                        onClick = onRefreshShizuku,
-                        modifier = Modifier
-                            .clip(RoundedCornerShape(12.dp))
-                            .background(colors.backgroundCard)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Refresh,
-                            contentDescription = "刷新 Shizuku 状态",
-                            tint = colors.primary
-                        )
-                    }
+            if (!deviceReady) {
+                IconButton(
+                    onClick = onRefreshShizuku,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(colors.backgroundCard)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Refresh,
+                        contentDescription = "刷新 Shizuku 状态",
+                        tint = colors.primary
+                    )
                 }
+                Spacer(modifier = Modifier.width(4.dp))
+            }
+
+            // 三条杠：打开任务抽屉
+            IconButton(
+                onClick = onOpenSessions,
+                modifier = Modifier
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(colors.backgroundCard)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Menu,
+                    contentDescription = "任务列表",
+                    tint = colors.primary
+                )
             }
         }
 
@@ -152,9 +189,10 @@ fun HomeScreen(
                 .weight(1f)
                 .fillMaxWidth()
         ) {
-            if (isRunning || steps.isNotEmpty()) {
-                ExecutionConversation(
-                    instruction = lastInstruction.ifBlank { agentState?.instruction ?: "" },
+            if (hasConversation) {
+                SessionTimeline(
+                    session = session,
+                    fallbackInstruction = lastInstruction.ifBlank { agentState?.instruction ?: "" },
                     steps = steps,
                     isRunning = isRunning,
                     summary = agentState?.summary,
@@ -166,7 +204,7 @@ fun HomeScreen(
             } else {
                 PresetCommandsView(
                     onCommandClick = { command ->
-                        if (shizukuAvailable) {
+                        if (deviceReady) {
                             inputText = command
                         } else {
                             onShizukuRequired()
@@ -201,9 +239,16 @@ fun HomeScreen(
                 onStop()
             },
             isRunning = isRunning,
-            enabled = shizukuAvailable,
+            enabled = deviceReady,
+            hint = if (sessionMessages.isNotEmpty()) {
+                // 房间里已经有对话 —— 说明这条是「纠错」或者「追加要求」
+                "继续说，让豆糕改正或接着做…"
+            } else {
+                "告诉豆糕你想做什么..."
+            },
+            stopLabel = if (sessionMessages.isNotEmpty()) "停止（停下后可以继续纠正它）" else "停止执行",
             onInputClick = {
-                if (!shizukuAvailable) {
+                if (!deviceReady) {
                     onShizukuRequired()
                 }
             }
@@ -212,8 +257,131 @@ fun HomeScreen(
 }
 
 // ======================================================================
-// 执行会话视图：用户气泡 + 执行全景折叠卡
+// 任务房间：多轮对话 + 执行全景
 // ======================================================================
+
+/**
+ * 一个任务房间的时间线。
+ *
+ * 和旧版的区别：旧版一次只能看「一条指令 + 一次执行」；
+ * 这里把房间里**所有**说过的话按顺序铺出来，所以用户停掉 AI 之后
+ * 往下接着说「你刚才做错了，应该这样」，整段历史都在，模型也拿得到。
+ */
+@Composable
+fun SessionTimeline(
+    session: TaskSession?,
+    fallbackInstruction: String,
+    steps: List<ExecutionStep>,
+    isRunning: Boolean,
+    summary: String?,
+    phase: AgentPhase,
+    currentModel: String,
+    logs: List<String>,
+    modifier: Modifier = Modifier
+) {
+    val messages = session?.messages ?: emptyList()
+    val listState = rememberLazyListState()
+    val showPanorama = isRunning || steps.isNotEmpty() ||
+            summary != null || phase != AgentPhase.IDLE
+
+    // 有新内容就滚到底部
+    LaunchedEffect(messages.size, steps.size, isRunning) {
+        val total = messages.size + (if (showPanorama) 1 else 0)
+        if (total > 0) {
+            listState.animateScrollToItem(total - 1)
+        }
+    }
+
+    LazyColumn(
+        state = listState,
+        modifier = modifier.padding(horizontal = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        // 兜底：本轮的指令还没写进 session 时，用 agentState 里的补上
+        if (messages.isEmpty() && fallbackInstruction.isNotBlank()) {
+            item(key = "fallback-user") { UserBubble(fallbackInstruction) }
+        }
+
+        items(messages, key = { it.id }) { msg ->
+            if (msg.isUser) {
+                UserBubble(msg.text)
+            } else {
+                ResultBubble(msg)
+            }
+        }
+
+        if (showPanorama) {
+            item(key = "panorama") {
+                ExecutionPanorama(
+                    steps = steps,
+                    isRunning = isRunning,
+                    summary = summary,
+                    phase = phase,
+                    currentModel = currentModel,
+                    logs = logs
+                )
+            }
+        }
+
+        item(key = "bottom-space") { Spacer(modifier = Modifier.height(8.dp)) }
+    }
+}
+
+/** AI 的结果气泡（任务完成 / 已停止 / 出错） */
+@Composable
+private fun ResultBubble(msg: SessionMessage) {
+    val colors = BaoziTheme.colors
+    val isError = msg.kind == SessionMessage.KIND_ERROR
+    val isResult = msg.kind == SessionMessage.KIND_RESULT
+    val accent = if (isError) colors.error else colors.textSecondary
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Start
+    ) {
+        Column(modifier = Modifier.widthIn(max = 320.dp)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(start = 4.dp, bottom = 4.dp)
+            ) {
+                if (isError || isResult) {
+                    Icon(
+                        imageVector = if (isError) Icons.Default.Warning else Icons.Default.CheckCircle,
+                        contentDescription = null,
+                        tint = if (isError) colors.error else colors.success,
+                        modifier = Modifier.size(13.dp)
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                }
+                Text(
+                    text = if (isError) "豆糕 · 出错了" else "豆糕",
+                    fontSize = 11.sp,
+                    color = accent
+                )
+            }
+            Box(
+                modifier = Modifier
+                    .clip(
+                        RoundedCornerShape(
+                            topStart = 16.dp,
+                            topEnd = 16.dp,
+                            bottomStart = 4.dp,
+                            bottomEnd = 16.dp
+                        )
+                    )
+                    .background(colors.backgroundCard)
+                    .padding(horizontal = 14.dp, vertical = 10.dp)
+            ) {
+                Text(
+                    text = msg.text,
+                    fontSize = 14.sp,
+                    color = if (isError) colors.error else colors.textPrimary,
+                    lineHeight = 21.sp
+                )
+            }
+        }
+    }
+}
 
 @Composable
 fun ExecutionConversation(
@@ -712,7 +880,11 @@ fun InputArea(
     onStop: () -> Unit,
     isRunning: Boolean,
     enabled: Boolean,
-    onInputClick: () -> Unit = {}
+    onInputClick: () -> Unit = {},
+    /** 输入框里的提示文字 */
+    hint: String = "告诉豆糕你想做什么...",
+    /** 停止按钮上的文字 */
+    stopLabel: String = "停止执行"
 ) {
     val colors = BaoziTheme.colors
     Surface(
@@ -744,7 +916,7 @@ fun InputArea(
                     )
                     Spacer(modifier = Modifier.width(8.dp))
                     Text(
-                        text = "停止执行",
+                        text = stopLabel,
                         color = Color.White,
                         fontSize = 15.sp,
                         fontWeight = FontWeight.Medium
@@ -772,9 +944,10 @@ fun InputArea(
                                 Box {
                                     if (inputText.isEmpty()) {
                                         Text(
-                                            text = "告诉豆糕你想做什么...",
+                                            text = hint,
                                             color = colors.textHint,
-                                            fontSize = 15.sp
+                                            fontSize = 15.sp,
+                                            maxLines = 1
                                         )
                                     }
                                     innerTextField()

@@ -4,6 +4,7 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
 import android.content.ServiceConnection
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -29,15 +30,48 @@ import java.util.concurrent.TimeUnit
  * 设备控制器
  *
  * 执行优先级（豆糕重构）：
- *   1. [ShizukuShell] —— `Shizuku.newProcess` 起独立 shell 进程，**能从 stdout 读二进制**，
- *      截图不再落盘、不再踩权限。这是主通道。
- *   2. AIDL UserService（[ShellService]）—— 兼容旧环境，只在 1 不可用时兜底。
- *   3. 本地 `Runtime.exec` —— 无权限时的最后尝试（基本不会成功，仅保证不崩溃）。
+ *   1. [DouGaoAccessibilityService] —— 系统无障碍通道：手势、写文字、截图（11+），
+ *      **完全不依赖 Shizuku**，中文输入最稳。
+ *   2. [ShizukuShell] —— `Shizuku.newProcess` 起独立 shell 进程，**能从 stdout 读二进制**，
+ *      截图不再落盘、不再踩权限。
+ *   3. AIDL UserService（[ShellService]）—— 兼容旧环境，只在 1/2 不可用时兜底。
+ *   4. 本地 `Runtime.exec` —— 无权限时的最后尝试（基本不会成功，仅保证不崩溃）。
  *
- * 截图主通道：`screencap -p` 直接读 stdout 原始 PNG 字节。
- * 这是参考 AndroidAutoGLM / Aries-AI 后的结论 —— 它们都不落盘。
+ * 到底走哪条通道由用户在「设置 → 高级选项」里选（无障碍模式 / Shizuku 模式）。
  */
 class DeviceController(private val context: Context? = null) {
+
+    /**
+     * 控制通道偏好（由设置页下发）
+     *
+     * @param accessibility 用户是否开启了「无障碍模式」
+     * @param shizuku      用户是否开启了「Shizuku 模式」
+     */
+    data class ControlPrefs(
+        val accessibility: Boolean = false,
+        val shizuku: Boolean = true
+    )
+
+    @Volatile
+    var controlPrefs: ControlPrefs = ControlPrefs()
+
+    /**
+     * 极速模式（豆糕 1.2.1）。
+     * 打开后发给模型的截图从 1024 降到 768、JPEG 质量从 80 降到 70 ——
+     * 上传体积约少一半，模型要"看"的图块也少四成，每步都能省下几百毫秒到一秒。
+     * 由设置页下发，改开关后下一次执行就生效。
+     */
+    @Volatile
+    var speedMode: Boolean = false
+
+    /**
+     * Root 模式（豆糕 1.2.2）。
+     *
+     * 打开后豆糕会用 `su` 直接以 root 身份跑控屏命令，
+     * 前提是用户在 Magisk / KernelSU 里给豆糕授过权。由设置页下发。
+     */
+    @Volatile
+    var rootMode: Boolean = false
 
     companion object {
         /**
@@ -51,6 +85,12 @@ class DeviceController(private val context: Context? = null) {
 
         /** 发模型前的最大边（越大越准，越小越快；1024 是业界经验值） */
         private const val MODEL_IMAGE_MAX_DIM = 1024
+
+        /** 极速模式下的最大边 */
+        private const val MODEL_IMAGE_MAX_DIM_FAST = 768
+
+        /** 极速模式下的 JPEG 质量 */
+        private const val MODEL_IMAGE_QUALITY_FAST = 70
     }
 
     private var appExternalDir: String? = null
@@ -122,6 +162,60 @@ class DeviceController(private val context: Context? = null) {
         return ShizukuShell.isAvailable() || (serviceBound && shellService != null)
     }
 
+    // ------------------------------------------------------------------
+    // 无障碍通道（豆糕新增）
+    // ------------------------------------------------------------------
+
+    /** 无障碍服务是否已连接 */
+    fun isAccessibilityConnected(): Boolean = DouGaoAccessibilityService.isConnected()
+
+    /**
+     * 无障碍通道能不能截图。
+     *
+     * `AccessibilityService.takeScreenshot` 是 **Android 11（API 30）** 才有的接口。
+     * 更低的版本无障碍只能点按、拿不到画面，而豆糕每一步都要看图才能决策 ——
+     * 所以安卓 11 以下「无障碍模式」是不可用的，设置页里会直接置灰。
+     *
+     * （Shizuku 与 Root 通道走的是 `screencap`，从安卓 4 就有，不受这个限制。）
+     */
+    fun isAccessibilityCaptureSupported(): Boolean =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+
+    /** shell 通道是否就绪 */
+    fun isShellReady(): Boolean = ShizukuShell.isAvailable() || (serviceBound && shellService != null)
+
+    /** 豆糕自己有没有 root 权限（与 Shizuku 无关） */
+    fun isRootAvailable(): Boolean = RootShell.isAvailable()
+
+    /** 重新探测一次 root（用户在管理器里刚授权时调用） */
+    fun refreshRootState(): Boolean {
+        RootShell.invalidate()
+        return RootShell.isAvailable()
+    }
+
+    /** Root 模式是否真的能用 */
+    private fun isRootReady(): Boolean = rootMode && RootShell.isAvailable()
+
+    private fun a11y(): DouGaoAccessibilityService? = DouGaoAccessibilityService.shared
+
+    /**
+     * 这次动作要不要走无障碍通道：
+     *  - 用户显式开了「无障碍模式」→ 走无障碍；
+     *  - 没显式开，但 Shizuku 通道不可用 → 兜底走无障碍；
+     *  - 其余情况走 Shizuku（截图更稳，速度也快）。
+     */
+    private fun useAccessibility(): Boolean {
+        if (a11y() == null) return false
+        if (controlPrefs.accessibility) return true
+        // 用户明确关掉了 Shizuku 模式 → 只走无障碍
+        if (!controlPrefs.shizuku) return true
+        return !isShellReady()
+    }
+
+    /** 整体是否具备控屏能力（无障碍 / Shizuku / Root 任一可用） */
+    fun canControlDevice(): Boolean =
+        isAccessibilityConnected() || isShellReady() || isRootReady()
+
     enum class ShizukuPrivilegeLevel { NONE, ADB, ROOT }
 
     fun getShizukuPrivilegeLevel(): ShizukuPrivilegeLevel {
@@ -155,9 +249,14 @@ class DeviceController(private val context: Context? = null) {
     }
 
     /**
-     * 执行 shell 并返回文本。优先 Shizuku 直连，其次 AIDL 服务，最后本地。
+     * 执行 shell 并返回文本。
+     * 优先 Root（用户显式开了 Root 模式时）→ Shizuku 直连 → AIDL 服务 → 本地。
      */
     private fun exec(command: String): String {
+        if (isRootReady()) {
+            val r = RootShell.execResult(command)
+            if (r.exitCode != RootShell.EXIT_EXCEPTION) return r.combinedText()
+        }
         if (ShizukuShell.isAvailable()) {
             val r = ShizukuShell.execResult(command)
             if (r.exitCode != ShizukuShell.EXIT_EXCEPTION) return r.combinedText()
@@ -171,6 +270,10 @@ class DeviceController(private val context: Context? = null) {
 
     /** 执行 shell，只关心成败 */
     private fun execOk(command: String): Boolean {
+        if (isRootReady()) {
+            val r = RootShell.execResult(command)
+            if (r.exitCode != RootShell.EXIT_EXCEPTION) return r.isOk
+        }
         if (ShizukuShell.isAvailable()) {
             val r = ShizukuShell.execResult(command)
             if (r.exitCode != ShizukuShell.EXIT_EXCEPTION) return r.isOk
@@ -189,14 +292,17 @@ class DeviceController(private val context: Context? = null) {
     // ------------------------------------------------------------------
 
     fun tap(x: Int, y: Int) {
+        if (useAccessibility() && a11y()?.tap(x, y) == true) return
         exec("input tap $x $y")
     }
 
     fun longPress(x: Int, y: Int, durationMs: Int = 800) {
+        if (useAccessibility() && a11y()?.longPress(x, y, durationMs) == true) return
         exec("input swipe $x $y $x $y $durationMs")
     }
 
     fun doubleTap(x: Int, y: Int) {
+        if (useAccessibility() && a11y()?.doubleTap(x, y) == true) return
         exec("input tap $x $y")
         try {
             Thread.sleep(90)
@@ -206,18 +312,24 @@ class DeviceController(private val context: Context? = null) {
     }
 
     fun swipe(x1: Int, y1: Int, x2: Int, y2: Int, durationMs: Int = 400) {
+        if (useAccessibility() && a11y()?.swipe(x1, y1, x2, y2, durationMs) == true) return
         exec("input swipe $x1 $y1 $x2 $y2 $durationMs")
     }
 
     /**
      * 输入文本。
      *
-     * 参考 Open-AutoGLM / AndroidAutoGLM 的踩坑结论：
-     * `input text` 对中文和特殊字符几乎必挂；这里分两条路 ——
-     * 纯 ASCII 走 input text，含非 ASCII 走「系统剪贴板 + 粘贴键」，最后再兜一层内置广播 IME。
+     * 优先顺序：
+     *   1. 无障碍 ACTION_SET_TEXT —— 直接往焦点输入框写文字，**中文 / emoji / 特殊符号全支持**；
+     *   2. 纯 ASCII 走 `input text`（快）；
+     *   3. 含非 ASCII 走「系统剪贴板 + 粘贴键」；
+     *   4. 最后兜底内置广播 IME。
      */
     fun type(text: String) {
         if (text.isEmpty()) return
+
+        if (useAccessibility() && a11y()?.inputText(text) == true) return
+
         val hasNonAscii = text.any { it.code > 127 }
 
         if (!hasNonAscii) {
@@ -262,10 +374,12 @@ class DeviceController(private val context: Context? = null) {
     }
 
     fun back() {
+        if (useAccessibility() && a11y()?.pressBack() == true) return
         exec("input keyevent 4")
     }
 
     fun home() {
+        if (useAccessibility() && a11y()?.pressHome() == true) return
         exec("input keyevent 3")
     }
 
@@ -288,6 +402,7 @@ class DeviceController(private val context: Context? = null) {
      * 截图（豆糕重构版）
      *
      * 顺序：
+     *   0. 无障碍 takeScreenshot（Android 11+，不需要 Shizuku）；
      *   1. `Shizuku.newProcess` 直接跑 `screencap -p`，从 stdout 读 PNG 原始字节 —— 最快最稳；
      *   2. 落盘到 App 外部私有目录再读 —— 兼容极老环境；
      *   3. 全部失败返回带原因的黑屏占位图（不再默默假装成功）。
@@ -295,10 +410,27 @@ class DeviceController(private val context: Context? = null) {
     suspend fun screenshotWithFallback(): ScreenshotResult = withContext(Dispatchers.IO) {
         var lastError: String? = null
 
+        // 通道 0：无障碍截图（开了无障碍模式 / Shizuku 不可用时优先）
+        if (useAccessibility()) {
+            captureViaAccessibility()?.let { return@withContext ScreenshotResult(it) }
+        }
+
+        // 通道 0.5：Root 直读（开了 Root 模式且拿到 root 时，优先）
+        if (isRootReady()) {
+            captureViaRoot()?.let { bytes ->
+                decodeBitmap(bytes)?.let { return@withContext ScreenshotResult(it) }
+            }
+        }
+
         repeat(2) { round ->
             // 通道 1：stdout 直读（主通道）
             captureViaStdout()?.let { bytes ->
                 decodeBitmap(bytes)?.let { return@withContext ScreenshotResult(it) }
+            }
+
+            // 通道 1.5：无障碍截图补一刀（Shizuku 抽风但无障碍还活着）
+            if (!useAccessibility()) {
+                captureViaAccessibility()?.let { return@withContext ScreenshotResult(it) }
             }
 
             // 通道 2：落盘再读（兜底）
@@ -310,9 +442,25 @@ class DeviceController(private val context: Context? = null) {
             if (round == 0) delay(120)
         }
 
-        val detail = lastError ?: "截屏通道均不可用（请确认 Shizuku 已启动并授权）"
+        val detail = lastError ?: "截屏通道均不可用（请确认已开启无障碍服务或 Shizuku 已启动并授权）"
         println("[DeviceController] 截图失败：$detail")
         createFallbackScreenshot(isSensitive = false, detail = detail)
+    }
+
+    /** 无障碍截图：Android 11+ 才有，返回 null 表示走不通 */
+    private suspend fun captureViaAccessibility(): Bitmap? {
+        val service = a11y() ?: return null
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        return try {
+            val bmp = service.screenshotBitmap()
+            if (bmp == null) {
+                lastCaptureError = "无障碍截图被系统拒绝（可能是支付/密码等安全页面）"
+            }
+            bmp
+        } catch (t: Throwable) {
+            lastCaptureError = "无障碍截图异常：${t.message}"
+            null
+        }
     }
 
     /** 记录最近一次失败原因 */
@@ -359,8 +507,41 @@ class DeviceController(private val context: Context? = null) {
         return bytes
     }
 
-    private fun screenshotFallbackPath(): String {
-        val dir = appExternalDir
+    /**
+     * Root 通道截图：`su -c screencap -p`，stdout 直读 PNG 字节。
+     * 和 Shizuku 一样不落盘，所以任何安卓版本都能用（screencap 从安卓 4 就有）。
+     */
+    private fun captureViaRoot(): ByteArray? {
+        val result = RootShell.execResult("screencap -p")
+        val err = result.stderrText()
+
+        if (err.contains("Status: -1") || err.contains("Failed", ignoreCase = true)) {
+            lastCaptureError = "系统阻止截图（可能是支付/密码页面）"
+            return null
+        }
+        if (result.exitCode == RootShell.EXIT_NO_ROOT) {
+            lastCaptureError = "豆糕还没有拿到 root 权限"
+            return null
+        }
+        if (result.exitCode != 0) {
+            lastCaptureError = "root screencap 执行失败（exit=${result.exitCode}）${if (err.isNotBlank()) " · ${err.take(120)}" else ""}"
+            return null
+        }
+
+        val bytes = result.stdout
+        if (bytes.isEmpty()) {
+            lastCaptureError = "root screencap 没有输出数据"
+            return null
+        }
+        if (bytes.size < 8 || bytes[0] != 0x89.toByte() || bytes[1] != 'P'.code.toByte()) {
+            lastCaptureError = "root screencap 输出不是合法图片"
+            return null
+        }
+        lastCaptureError = null
+        return bytes
+    }
+
+    private fun screenshotFallbackPath(): String {        val dir = appExternalDir
         return if (dir != null) "$dir/$FALLBACK_SCREENSHOT_NAME" else "/data/local/tmp/$FALLBACK_SCREENSHOT_NAME"
     }
 
@@ -472,11 +653,15 @@ class DeviceController(private val context: Context? = null) {
      *
      * 参考 AndroidAutoGLM：最大边压到 1024、质量 80。
      * 这一步做完，单张图大概 100~200KB，比原图小一个数量级，直接决定每步快不快。
+     * 极速模式下进一步压到 768 / 质量 70。
      */
     fun toModelBase64(bitmap: Bitmap): String {
+        val maxDimLimit = if (speedMode) MODEL_IMAGE_MAX_DIM_FAST else MODEL_IMAGE_MAX_DIM
+        val quality = if (speedMode) MODEL_IMAGE_QUALITY_FAST else 80
+
         val maxDim = maxOf(bitmap.width, bitmap.height)
-        val scaled = if (maxDim > MODEL_IMAGE_MAX_DIM) {
-            val scale = MODEL_IMAGE_MAX_DIM.toFloat() / maxDim
+        val scaled = if (maxDim > maxDimLimit) {
+            val scale = maxDimLimit.toFloat() / maxDim
             Bitmap.createScaledBitmap(
                 bitmap,
                 (bitmap.width * scale).toInt().coerceAtLeast(1),
@@ -487,7 +672,7 @@ class DeviceController(private val context: Context? = null) {
             bitmap
         }
         val out = ByteArrayOutputStream()
-        scaled.compress(Bitmap.CompressFormat.JPEG, 80, out)
+        scaled.compress(Bitmap.CompressFormat.JPEG, quality, out)
         if (scaled !== bitmap) scaled.recycle()
         return android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
     }
@@ -497,6 +682,12 @@ class DeviceController(private val context: Context? = null) {
     // ------------------------------------------------------------------
 
     fun getScreenSize(): Pair<Int, Int> {
+        // 无障碍通道能直接拿到真实分辨率，省掉一次 shell 往返
+        a11y()?.let {
+            val size = it.screenSize()
+            if (size.first > 0 && size.second > 0) return size
+        }
+
         val output = exec("wm size")
         val match = Regex("(\\d+)x(\\d+)").find(output)
         val (physicalWidth, physicalHeight) = if (match != null) {
@@ -522,6 +713,8 @@ class DeviceController(private val context: Context? = null) {
 
     /** 当前前台应用包名（给模型当上下文用） */
     fun getCurrentAppPackage(): String? {
+        // 无障碍通道：直接读当前窗口的包名，最快
+        a11y()?.currentPackageName()?.let { return it }
         return try {
             val output = exec("dumpsys window 2>/dev/null | grep -m1 mCurrentFocus")
             // 形如：mCurrentFocus=Window{abc u0 com.tencent.mm/com.tencent.mm.ui.LauncherUI}
@@ -591,6 +784,12 @@ class DeviceController(private val context: Context? = null) {
             }
         }
 
+        // 0) 没有 shell 通道（比如只开了无障碍模式）→ 直接用系统 API 拉起。
+        //    豆糕执行前必须授予悬浮窗权限，因此不受「后台启动 Activity」限制。
+        if (!isShellReady()) {
+            if (launchViaPackageManager(packageName)) return true
+        }
+
         // 1) am start -p
         val out1 = exec(
             "am start --user 0 -a android.intent.action.MAIN " +
@@ -611,7 +810,27 @@ class DeviceController(private val context: Context? = null) {
 
         // 3) monkey 兜底
         val out3 = exec("monkey -p $packageName -c android.intent.category.LAUNCHER 1 2>/dev/null")
-        return !isLaunchFailure(out3)
+        if (!isLaunchFailure(out3)) return true
+
+        // 4) 最后再试一次系统 API
+        return launchViaPackageManager(packageName)
+    }
+
+    /** 用 PackageManager 直接拉起应用（不需要任何 shell 权限） */
+    private fun launchViaPackageManager(packageName: String): Boolean {
+        val ctx: Context =
+            context ?: runCatching { App.getInstance() }.getOrNull() ?: return false
+        return try {
+            val intent = ctx.packageManager.getLaunchIntentForPackage(packageName)
+                ?: return false
+            intent.addFlags(
+                Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_RESET_TASK_IF_NEEDED
+            )
+            ctx.startActivity(intent)
+            true
+        } catch (e: Exception) {
+            false
+        }
     }
 
     private fun isLaunchFailure(output: String): Boolean {

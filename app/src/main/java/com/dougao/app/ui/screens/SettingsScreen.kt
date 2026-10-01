@@ -59,12 +59,22 @@ fun SettingsScreen(
     onUpdateCachedModels: (List<String>) -> Unit,
     onUpdateThemeMode: (ThemeMode) -> Unit,
     onUpdateMaxSteps: (Int) -> Unit,
-    onUpdateCloudCrashReport: (Boolean) -> Unit,
+    onUpdateAccessibilityMode: (Boolean) -> Unit,
+    onUpdateShizukuMode: (Boolean) -> Unit,
+    onUpdateSpeedMode: (Boolean) -> Unit = {},
     onUpdateRootModeEnabled: (Boolean) -> Unit,
     onUpdateSuCommandEnabled: (Boolean) -> Unit,
     onSelectProvider: (ApiProvider) -> Unit,
     shizukuAvailable: Boolean,
+    accessibilityConnected: Boolean = false,
+    /** 无障碍通道能不能截图（安卓 11 以下不行，开关会置灰） */
+    accessibilityCaptureSupported: Boolean = true,
+    /** 豆糕自己有没有 root 权限 */
+    rootAvailable: Boolean = false,
+    /** 用户点了 Root 开关时，去重新探测一次 root */
+    onRefreshRoot: () -> Unit = {},
     shizukuPrivilegeLevel: String = "ADB", // "ADB", "ROOT", "NONE"
+    onOpenAccessibilitySettings: () -> Unit = {},
     onFetchModels: ((onSuccess: (List<String>) -> Unit, onError: (String) -> Unit) -> Unit)? = null,
     // ---- 豆糕新增：多模型管理入口 ----
     onManageModels: () -> Unit = {}
@@ -77,6 +87,7 @@ fun SettingsScreen(
     var showOverlayHelpDialog by remember { mutableStateOf(false) }
     var showRootModeWarningDialog by remember { mutableStateOf(false) }
     var showSuCommandWarningDialog by remember { mutableStateOf(false) }
+    var showAccessibilityHelpDialog by remember { mutableStateOf(false) }
 
     LazyColumn(
         modifier = Modifier
@@ -108,7 +119,12 @@ fun SettingsScreen(
 
         // 连接状态卡片
         item {
-            StatusCard(shizukuAvailable = shizukuAvailable)
+            StatusCard(
+                shizukuAvailable = shizukuAvailable,
+                // 豆糕 1.3.2：必须「开关打开」且「系统服务真的连着」才算无障碍可用。
+                // 以前只看系统服务连没连，用户把开关关了、横幅还显示「无障碍已就绪」。
+                accessibilityConnected = settings.accessibilityModeEnabled && accessibilityConnected
+            )
         }
 
         // 外观设置分组
@@ -140,18 +156,353 @@ fun SettingsScreen(
             SettingsItem(
                 icon = Icons.Default.Settings,
                 title = "最大执行步数",
-                subtitle = "${settings.maxSteps} 步",
+                subtitle = settings.maxStepsLabel,
                 onClick = { showMaxStepsDialog = true }
             )
         }
 
-        // Shizuku 高级设置分组（仅在 Shizuku 可用时显示）
-        if (shizukuAvailable) {
-            item {
-                SettingsSection(title = "Shizuku 高级选项")
+        // ---- 极速模式（豆糕 1.2.1 新增）----
+        item {
+            val enabled = settings.speedModeEnabled
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = colors.backgroundCard)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(
+                                (if (enabled) colors.success else colors.primary).copy(alpha = 0.15f)
+                            ),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Build,
+                            contentDescription = null,
+                            tint = if (enabled) colors.success else colors.primary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "极速模式",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = colors.textPrimary
+                        )
+                        Text(
+                            text = if (enabled) {
+                                "已开启 · 不做深度思考、截图更轻、等待更短，每步快好几倍"
+                            } else {
+                                "已关闭 · 模型会先想清楚再动手，更稳但更慢"
+                            },
+                            fontSize = 13.sp,
+                            color = if (enabled) colors.success else colors.textSecondary,
+                            maxLines = 3
+                        )
+                    }
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { onUpdateSpeedMode(it) },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = colors.success,
+                            checkedTrackColor = colors.success.copy(alpha = 0.5f),
+                            uncheckedThumbColor = colors.textHint,
+                            uncheckedTrackColor = colors.backgroundInput
+                        )
+                    )
+                }
+            }
+        }
+
+        // ================= 高级选项：控制通道 =================
+        item {
+            SettingsSection(title = "高级选项")
+        }
+
+        // ---- 无障碍模式 ----
+        item {
+            val supported = accessibilityCaptureSupported
+            val enabled = settings.accessibilityModeEnabled && supported
+            val ready = accessibilityConnected
+            val accent = when {
+                !supported -> colors.textHint
+                enabled && ready -> colors.success
+                else -> colors.primary
             }
 
-            // 显示当前权限级别
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .clickable {
+                        if (!supported) return@clickable
+                        if (!enabled) {
+                            onUpdateAccessibilityMode(true)
+                            if (!ready) onOpenAccessibilitySettings()
+                        } else if (!ready) {
+                            onOpenAccessibilitySettings()
+                        } else {
+                            showAccessibilityHelpDialog = true
+                        }
+                    },
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = colors.backgroundCard)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(accent.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Star,
+                            contentDescription = null,
+                            tint = accent,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "无障碍模式",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = if (supported) colors.textPrimary else colors.textHint
+                        )
+                        Text(
+                            text = when {
+                                !supported ->
+                                    "本机是安卓 11 以下，无障碍拿不到画面 · 请用 Shizuku 或 Root 模式"
+                                !enabled && ready ->
+                                    "未开启 · 系统里的无障碍服务还开着，可在系统设置里关掉"
+                                !enabled -> "未开启 · 打开后无需 Shizuku 就能控屏"
+                                ready -> "已开启 · 系统服务已连接，可正常控屏"
+                                else -> "已开启 · 还需去系统设置里打开「豆糕」"
+                            },
+                            fontSize = 13.sp,
+                            color = when {
+                                !supported -> colors.textHint
+                                !enabled -> colors.textSecondary
+                                ready -> colors.success
+                                else -> colors.error
+                            },
+                            maxLines = 3
+                        )
+                    }
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { on ->
+                            if (!supported) return@Switch
+                            onUpdateAccessibilityMode(on)
+                            if (on && !ready) onOpenAccessibilitySettings()
+                        },
+                        enabled = supported,
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = colors.success,
+                            checkedTrackColor = colors.success.copy(alpha = 0.5f),
+                            uncheckedThumbColor = colors.textHint,
+                            uncheckedTrackColor = colors.backgroundInput,
+                            disabledUncheckedThumbColor = colors.textHint.copy(alpha = 0.5f),
+                            disabledUncheckedTrackColor = colors.backgroundInput.copy(alpha = 0.5f)
+                        )
+                    )
+                }
+            }
+        }
+
+        // ---- Shizuku 模式 ----
+        item {
+            val enabled = settings.shizukuModeEnabled
+            val connected = shizukuAvailable
+            val levelText = when (shizukuPrivilegeLevel) {
+                "ROOT" -> "Root 权限 (UID 0)"
+                "ADB" -> "ADB 权限 (UID 2000)"
+                else -> "未连接"
+            }
+            val accent = if (connected) colors.primary else colors.textHint
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .clickable {
+                        if (!connected) showShizukuHelpDialog = true
+                        else if (!enabled) onUpdateShizukuMode(true)
+                    },
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = colors.backgroundCard)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(accent.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Build,
+                            contentDescription = null,
+                            tint = accent,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Shizuku 模式",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = colors.textPrimary
+                        )
+                        Text(
+                            text = when {
+                                !connected -> "Shizuku 未连接 · 点击查看安装指南"
+                                enabled -> "已连接 · $levelText"
+                                else -> "已连接但未启用 · 点击开启"
+                            },
+                            fontSize = 13.sp,
+                            color = if (connected && enabled) colors.primary else colors.textSecondary,
+                            maxLines = 2
+                        )
+                    }
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { on ->
+                            onUpdateShizukuMode(on)
+                            if (on && !connected) showShizukuHelpDialog = true
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = colors.primary,
+                            checkedTrackColor = colors.primary.copy(alpha = 0.5f),
+                            uncheckedThumbColor = colors.textHint,
+                            uncheckedTrackColor = colors.backgroundInput
+                        )
+                    )
+                }
+            }
+        }
+
+        // ---- Root 模式 ----
+        // 语义：在 root 管理器（Magisk / KernelSU）里**直接给豆糕授权**，
+        // 豆糕就拿到 root 身份，可以自己直接操作手机 —— 不需要 Shizuku、也不需要无障碍。
+        item {
+            val enabled = settings.rootModeEnabled
+            val accent = when {
+                enabled && rootAvailable -> colors.error
+                enabled -> colors.primary
+                else -> colors.textHint
+            }
+
+            Card(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp, vertical = 4.dp)
+                    .clickable {
+                        if (!enabled) {
+                            onRefreshRoot()
+                            showRootModeWarningDialog = true
+                        } else {
+                            onUpdateRootModeEnabled(false)
+                        }
+                    },
+                shape = RoundedCornerShape(12.dp),
+                colors = CardDefaults.cardColors(containerColor = colors.backgroundCard)
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(16.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Box(
+                        modifier = Modifier
+                            .size(40.dp)
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(accent.copy(alpha = 0.15f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = null,
+                            tint = accent,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Root 模式",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.Medium,
+                            color = if (enabled) colors.textPrimary else colors.textHint
+                        )
+                        Text(
+                            text = when {
+                                !enabled -> "给豆糕 root 权限，它就能直接操作手机（无需 Shizuku）"
+                                rootAvailable -> "已开启 · 已拿到 root 权限，可直接控屏"
+                                else -> "已开启 · 还没拿到 root 权限，请到 Root 管理器里授权「豆糕」"
+                            },
+                            fontSize = 13.sp,
+                            color = when {
+                                !enabled -> colors.textHint
+                                rootAvailable -> colors.error
+                                else -> colors.primary
+                            },
+                            maxLines = 3
+                        )
+                    }
+                    Switch(
+                        checked = enabled,
+                        onCheckedChange = { on ->
+                            if (on) {
+                                onRefreshRoot()
+                                showRootModeWarningDialog = true
+                            } else {
+                                onUpdateRootModeEnabled(false)
+                            }
+                        },
+                        colors = SwitchDefaults.colors(
+                            checkedThumbColor = colors.error,
+                            checkedTrackColor = colors.error.copy(alpha = 0.5f),
+                            uncheckedThumbColor = colors.textHint,
+                            uncheckedTrackColor = colors.backgroundInput,
+                            disabledCheckedThumbColor = colors.textHint,
+                            disabledCheckedTrackColor = colors.backgroundInput,
+                            disabledUncheckedThumbColor = colors.textHint.copy(alpha = 0.5f),
+                            disabledUncheckedTrackColor = colors.backgroundInput.copy(alpha = 0.5f)
+                        )
+                    )
+                }
+            }
+        }
+
+        // su -c 开关（仅在 Root 模式开启时显示）
+        if (settings.rootModeEnabled) {
             item {
                 Card(
                     modifier = Modifier
@@ -170,193 +521,83 @@ fun SettingsScreen(
                             modifier = Modifier
                                 .size(40.dp)
                                 .clip(RoundedCornerShape(10.dp))
-                                .background(
-                                    when (shizukuPrivilegeLevel) {
-                                        "ROOT" -> colors.error.copy(alpha = 0.15f)
-                                        else -> colors.primary.copy(alpha = 0.15f)
-                                    }
-                                ),
+                                .background(colors.error.copy(alpha = 0.15f)),
                             contentAlignment = Alignment.Center
                         ) {
                             Icon(
-                                imageVector = Icons.Default.Info,
+                                imageVector = Icons.Default.Lock,
                                 contentDescription = null,
-                                tint = when (shizukuPrivilegeLevel) {
-                                    "ROOT" -> colors.error
-                                    else -> colors.primary
-                                },
+                                tint = colors.error,
                                 modifier = Modifier.size(22.dp)
                             )
                         }
                         Spacer(modifier = Modifier.width(16.dp))
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "当前权限级别",
+                                text = "允许 su -c 命令",
                                 fontSize = 15.sp,
                                 fontWeight = FontWeight.Medium,
                                 color = colors.textPrimary
                             )
                             Text(
-                                text = when (shizukuPrivilegeLevel) {
-                                    "ROOT" -> "Root 模式 (UID 0)"
-                                    "ADB" -> "ADB 模式 (UID 2000)"
-                                    else -> "未连接"
-                                },
+                                text = if (settings.suCommandEnabled) "AI 可执行 Root 命令" else "禁止执行 su -c",
                                 fontSize = 13.sp,
-                                color = when (shizukuPrivilegeLevel) {
-                                    "ROOT" -> colors.error
-                                    else -> colors.textSecondary
-                                },
-                                maxLines = 1
-                            )
-                        }
-                    }
-                }
-            }
-
-            // Root 模式开关（仅在 Shizuku 以 Root 权限运行时可用）
-            item {
-                val isShizukuRoot = shizukuPrivilegeLevel == "ROOT"
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 16.dp, vertical = 4.dp),
-                    shape = RoundedCornerShape(12.dp),
-                    colors = CardDefaults.cardColors(containerColor = colors.backgroundCard)
-                ) {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(16.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Box(
-                            modifier = Modifier
-                                .size(40.dp)
-                                .clip(RoundedCornerShape(10.dp))
-                                .background(
-                                    if (isShizukuRoot) colors.error.copy(alpha = 0.15f)
-                                    else colors.textHint.copy(alpha = 0.15f)
-                                ),
-                            contentAlignment = Alignment.Center
-                        ) {
-                            Icon(
-                                imageVector = Icons.Default.Warning,
-                                contentDescription = null,
-                                tint = if (isShizukuRoot) colors.error else colors.textHint,
-                                modifier = Modifier.size(22.dp)
-                            )
-                        }
-                        Spacer(modifier = Modifier.width(16.dp))
-                        Column(modifier = Modifier.weight(1f)) {
-                            Text(
-                                text = "Root 模式",
-                                fontSize = 15.sp,
-                                fontWeight = FontWeight.Medium,
-                                color = if (isShizukuRoot) colors.textPrimary else colors.textHint
-                            )
-                            Text(
-                                text = when {
-                                    !isShizukuRoot -> "需要 Shizuku 以 Root 权限运行"
-                                    settings.rootModeEnabled -> "已启用高级权限"
-                                    else -> "启用后可使用 Root 功能"
-                                },
-                                fontSize = 13.sp,
-                                color = when {
-                                    !isShizukuRoot -> colors.textHint
-                                    settings.rootModeEnabled -> colors.error
-                                    else -> colors.textSecondary
-                                },
+                                color = if (settings.suCommandEnabled) colors.error else colors.textSecondary,
                                 maxLines = 1
                             )
                         }
                         Switch(
-                            checked = settings.rootModeEnabled,
+                            checked = settings.suCommandEnabled,
                             onCheckedChange = { enabled ->
                                 if (enabled) {
-                                    showRootModeWarningDialog = true
+                                    showSuCommandWarningDialog = true
                                 } else {
-                                    onUpdateRootModeEnabled(false)
+                                    onUpdateSuCommandEnabled(false)
                                 }
                             },
-                            enabled = isShizukuRoot,
                             colors = SwitchDefaults.colors(
                                 checkedThumbColor = colors.error,
                                 checkedTrackColor = colors.error.copy(alpha = 0.5f),
                                 uncheckedThumbColor = colors.textHint,
-                                uncheckedTrackColor = colors.backgroundInput,
-                                disabledCheckedThumbColor = colors.textHint,
-                                disabledCheckedTrackColor = colors.backgroundInput,
-                                disabledUncheckedThumbColor = colors.textHint.copy(alpha = 0.5f),
-                                disabledUncheckedTrackColor = colors.backgroundInput.copy(alpha = 0.5f)
+                                uncheckedTrackColor = colors.backgroundInput
                             )
                         )
                     }
                 }
             }
+        }
 
-            // su -c 开关（仅在 Root 模式开启时显示）
-            if (settings.rootModeEnabled) {
-                item {
-                    Card(
+        // 三个通道都关掉时给个提醒
+        if (!settings.accessibilityModeEnabled &&
+            !settings.shizukuModeEnabled &&
+            !settings.rootModeEnabled
+        ) {
+            item {
+                Card(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 4.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = CardDefaults.cardColors(containerColor = colors.error.copy(alpha = 0.10f))
+                ) {
+                    Row(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 4.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.cardColors(containerColor = colors.backgroundCard)
+                            .padding(14.dp),
+                        verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(16.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            Box(
-                                modifier = Modifier
-                                    .size(40.dp)
-                                    .clip(RoundedCornerShape(10.dp))
-                                    .background(colors.error.copy(alpha = 0.15f)),
-                                contentAlignment = Alignment.Center
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Default.Lock,
-                                    contentDescription = null,
-                                    tint = colors.error,
-                                    modifier = Modifier.size(22.dp)
-                                )
-                            }
-                            Spacer(modifier = Modifier.width(16.dp))
-                            Column(modifier = Modifier.weight(1f)) {
-                                Text(
-                                    text = "允许 su -c 命令",
-                                    fontSize = 15.sp,
-                                    fontWeight = FontWeight.Medium,
-                                    color = colors.textPrimary
-                                )
-                                Text(
-                                    text = if (settings.suCommandEnabled) "AI 可执行 Root 命令" else "禁止执行 su -c",
-                                    fontSize = 13.sp,
-                                    color = if (settings.suCommandEnabled) colors.error else colors.textSecondary,
-                                    maxLines = 1
-                                )
-                            }
-                            Switch(
-                                checked = settings.suCommandEnabled,
-                                onCheckedChange = { enabled ->
-                                    if (enabled) {
-                                        showSuCommandWarningDialog = true
-                                    } else {
-                                        onUpdateSuCommandEnabled(false)
-                                    }
-                                },
-                                colors = SwitchDefaults.colors(
-                                    checkedThumbColor = colors.error,
-                                    checkedTrackColor = colors.error.copy(alpha = 0.5f),
-                                    uncheckedThumbColor = colors.textHint,
-                                    uncheckedTrackColor = colors.backgroundInput
-                                )
-                            )
-                        }
+                        Icon(
+                            imageVector = Icons.Default.Warning,
+                            contentDescription = null,
+                            tint = colors.error,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Spacer(modifier = Modifier.width(10.dp))
+                        Text(
+                            text = "无障碍、Shizuku、Root 三个通道都没开启，豆糕将无法操作手机。请至少开启其中一个。",
+                            fontSize = 12.sp,
+                            color = colors.error
+                        )
                     }
                 }
             }
@@ -383,67 +624,9 @@ fun SettingsScreen(
             )
         }
 
-        // 反馈分组
+        // 反馈分组（豆糕 1.2.0：已彻底移除「云端崩溃上报」，日志只留在本地）
         item {
             SettingsSection(title = "反馈与调试")
-        }
-
-        // 云端崩溃上报开关
-        item {
-            Card(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 4.dp),
-                shape = RoundedCornerShape(12.dp),
-                colors = CardDefaults.cardColors(containerColor = colors.backgroundCard)
-            ) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(16.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Box(
-                        modifier = Modifier
-                            .size(40.dp)
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(colors.primary.copy(alpha = 0.15f)),
-                        contentAlignment = Alignment.Center
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Info,
-                            contentDescription = null,
-                            tint = colors.primary,
-                            modifier = Modifier.size(22.dp)
-                        )
-                    }
-                    Spacer(modifier = Modifier.width(16.dp))
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text(
-                            text = "云端崩溃上报",
-                            fontSize = 15.sp,
-                            fontWeight = FontWeight.Medium,
-                            color = colors.textPrimary
-                        )
-                        Text(
-                            text = if (settings.cloudCrashReportEnabled) "已开启，帮助我们改进应用" else "已关闭",
-                            fontSize = 13.sp,
-                            color = colors.textSecondary,
-                            maxLines = 1
-                        )
-                    }
-                    Switch(
-                        checked = settings.cloudCrashReportEnabled,
-                        onCheckedChange = { onUpdateCloudCrashReport(it) },
-                        colors = SwitchDefaults.colors(
-                            checkedThumbColor = colors.primary,
-                            checkedTrackColor = colors.primary.copy(alpha = 0.5f),
-                            uncheckedThumbColor = colors.textHint,
-                            uncheckedTrackColor = colors.backgroundInput
-                        )
-                    )
-                }
-            }
         }
 
         item {
@@ -498,6 +681,15 @@ fun SettingsScreen(
         // 帮助分组
         item {
             SettingsSection(title = "帮助")
+        }
+
+        item {
+            SettingsItem(
+                icon = Icons.Default.Star,
+                title = "无障碍使用指南",
+                subtitle = "了解如何开启无障碍服务（推荐，免 Shizuku）",
+                onClick = { showAccessibilityHelpDialog = true }
+            )
         }
 
         item {
@@ -583,6 +775,17 @@ fun SettingsScreen(
         ShizukuHelpDialog(onDismiss = { showShizukuHelpDialog = false })
     }
 
+    // 无障碍帮助对话框
+    if (showAccessibilityHelpDialog) {
+        AccessibilityHelpDialog(
+            onDismiss = { showAccessibilityHelpDialog = false },
+            onOpenSettings = {
+                showAccessibilityHelpDialog = false
+                onOpenAccessibilitySettings()
+            }
+        )
+    }
+
     // 悬浮窗权限帮助对话框
     if (showOverlayHelpDialog) {
         OverlayHelpDialog(onDismiss = { showOverlayHelpDialog = false })
@@ -594,6 +797,8 @@ fun SettingsScreen(
             onDismiss = { showRootModeWarningDialog = false },
             onConfirm = {
                 onUpdateRootModeEnabled(true)
+                // 用户可能是刚在 Root 管理器里点了「允许」，再探一次
+                onRefreshRoot()
                 showRootModeWarningDialog = false
             }
         )
@@ -612,15 +817,33 @@ fun SettingsScreen(
 }
 
 @Composable
-fun StatusCard(shizukuAvailable: Boolean) {
+fun StatusCard(
+    shizukuAvailable: Boolean,
+    accessibilityConnected: Boolean = false
+) {
     val colors = BaoziTheme.colors
+    val ready = shizukuAvailable || accessibilityConnected
+
+    val title = when {
+        accessibilityConnected && shizukuAvailable -> "无障碍 + Shizuku 都已就绪"
+        accessibilityConnected -> "无障碍服务已连接"
+        shizukuAvailable -> "Shizuku 已连接"
+        else -> "设备控制未就绪"
+    }
+    val subtitle = when {
+        accessibilityConnected && shizukuAvailable -> "两条通道都可用，控屏最稳"
+        accessibilityConnected -> "无需 Shizuku，设备控制功能可用"
+        shizukuAvailable -> "设备控制功能可用"
+        else -> "请在下方「高级选项」里开启无障碍模式，或连接 Shizuku"
+    }
+
     Card(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 8.dp),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
-            containerColor = if (shizukuAvailable) colors.success.copy(alpha = 0.15f) else colors.error.copy(alpha = 0.15f)
+            containerColor = if (ready) colors.success.copy(alpha = 0.15f) else colors.error.copy(alpha = 0.15f)
         )
     ) {
         Row(
@@ -630,21 +853,21 @@ fun StatusCard(shizukuAvailable: Boolean) {
             verticalAlignment = Alignment.CenterVertically
         ) {
             Icon(
-                imageVector = if (shizukuAvailable) Icons.Default.CheckCircle else Icons.Default.Close,
+                imageVector = if (ready) Icons.Default.CheckCircle else Icons.Default.Close,
                 contentDescription = null,
-                tint = if (shizukuAvailable) colors.success else colors.error,
+                tint = if (ready) colors.success else colors.error,
                 modifier = Modifier.size(32.dp)
             )
             Spacer(modifier = Modifier.width(16.dp))
             Column {
                 Text(
-                    text = if (shizukuAvailable) "Shizuku 已连接" else "Shizuku 未连接",
+                    text = title,
                     fontSize = 16.sp,
                     fontWeight = FontWeight.Medium,
-                    color = if (shizukuAvailable) colors.success else colors.error
+                    color = if (ready) colors.success else colors.error
                 )
                 Text(
-                    text = if (shizukuAvailable) "设备控制功能可用" else "请启动 Shizuku 并授权",
+                    text = subtitle,
                     fontSize = 13.sp,
                     color = colors.textSecondary
                 )
@@ -1311,6 +1534,182 @@ fun ShizukuHelpDialog(onDismiss: () -> Unit) {
     )
 }
 
+/**
+ * 控屏权限引导：无障碍 或 Shizuku 二选一
+ */
+@Composable
+fun PermissionGuideDialog(
+    onDismiss: () -> Unit,
+    onOpenAccessibility: () -> Unit,
+    onOpenShizuku: () -> Unit
+) {
+    val colors = BaoziTheme.colors
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.backgroundCard,
+        title = {
+            Text("先给豆糕控屏权限", color = colors.textPrimary)
+        },
+        text = {
+            Column {
+                Text(
+                    text = "豆糕要替你操作手机，需要下面任意一种权限。开启一种就够了。",
+                    fontSize = 14.sp,
+                    color = colors.textSecondary,
+                    lineHeight = 20.sp
+                )
+                Spacer(modifier = Modifier.height(14.dp))
+
+                // 无障碍（推荐）
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onOpenAccessibility),
+                    shape = RoundedCornerShape(12.dp),
+                    color = colors.primary.copy(alpha = 0.10f)
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Icon(
+                                imageVector = Icons.Default.Star,
+                                contentDescription = null,
+                                tint = colors.primary,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text(
+                                text = "无障碍模式（推荐）",
+                                fontSize = 15.sp,
+                                fontWeight = FontWeight.SemiBold,
+                                color = colors.primary
+                            )
+                        }
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "系统自带，不用装任何东西；输入中文最稳，Android 11+ 还能直接截图。",
+                            fontSize = 12.sp,
+                            color = colors.textSecondary,
+                            lineHeight = 18.sp
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(10.dp))
+
+                // Shizuku
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable(onClick = onOpenShizuku),
+                    shape = RoundedCornerShape(12.dp),
+                    color = colors.backgroundInput
+                ) {
+                    Column(modifier = Modifier.padding(14.dp)) {
+                        Text(
+                            text = "Shizuku 模式",
+                            fontSize = 15.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            color = colors.textPrimary
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                        Text(
+                            text = "需要另外安装 Shizuku 应用并授权，兼容更多老机型。",
+                            fontSize = 12.sp,
+                            color = colors.textSecondary,
+                            lineHeight = 18.sp
+                        )
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text("稍后再说", color = colors.textSecondary)
+            }
+        }
+    )
+}
+
+@Composable
+fun AccessibilityHelpDialog(
+    onDismiss: () -> Unit,
+    onOpenSettings: () -> Unit
+) {
+    val colors = BaoziTheme.colors
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = colors.backgroundCard,
+        title = {
+            Text("无障碍使用指南", color = colors.textPrimary)
+        },
+        text = {
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState())
+            ) {
+                Text(
+                    text = "无障碍模式是豆糕推荐的控屏方式 —— 它是安卓官方给自动化留的正门，不需要装 Shizuku、不需要 root、不用连电脑。",
+                    fontSize = 13.sp,
+                    color = colors.textSecondary,
+                    lineHeight = 20.sp
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                HelpStep(
+                    number = "1",
+                    title = "打开无障碍设置",
+                    description = "点下面的按钮，会跳到「系统设置 → 无障碍 → 已下载的服务」"
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                HelpStep(
+                    number = "2",
+                    title = "找到并打开「豆糕」",
+                    description = "在列表里找到「豆糕」，点进去把开关打开，弹窗里点「允许」"
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                HelpStep(
+                    number = "3",
+                    title = "回来即可使用",
+                    description = "返回豆糕，设置页顶部的状态卡会变成「无障碍服务已连接」"
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                Text(
+                    text = "无障碍模式能做什么？",
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = colors.primary
+                )
+                Spacer(modifier = Modifier.height(6.dp))
+                BulletPoint("点击、长按、滑动、双击")
+                BulletPoint("输入中文、emoji（比 Shizuku 的 input text 更稳）")
+                BulletPoint("返回 / 主页 / 多任务")
+                BulletPoint("Android 11 及以上还能直接截图")
+
+                Spacer(modifier = Modifier.height(14.dp))
+                Text(
+                    text = "隐私说明：无障碍服务只在你主动下达任务时被调用，不监听、不记录、不上报任何屏幕内容，也不会在后台自动操作。",
+                    fontSize = 12.sp,
+                    color = colors.textHint,
+                    lineHeight = 18.sp
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onOpenSettings,
+                colors = ButtonDefaults.buttonColors(containerColor = colors.primary)
+            ) {
+                Text("去开启无障碍", color = Color.White)
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text("知道了", color = colors.textSecondary)
+            }
+        }
+    )
+}
+
 @Composable
 fun OverlayHelpDialog(onDismiss: () -> Unit) {
     val colors = BaoziTheme.colors
@@ -1447,7 +1846,11 @@ fun MaxStepsDialog(
     onConfirm: (Int) -> Unit
 ) {
     val colors = BaoziTheme.colors
-    var steps by remember { mutableStateOf(currentSteps.toFloat()) }
+    // currentSteps <= 0 视为「不限制」
+    var unlimited by remember { mutableStateOf(currentSteps <= 0) }
+    var steps by remember { mutableStateOf((if (currentSteps <= 0) 50 else currentSteps).toFloat()) }
+
+    val presets = listOf(0, 25, 50, 100)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -1458,7 +1861,7 @@ fun MaxStepsDialog(
         text = {
             Column {
                 Text(
-                    text = "设置 Agent 单次任务的最大执行步数。步数越多，能完成的任务越复杂，但消耗的 token 也越多。",
+                    text = "设置 Agent 单次任务的最大执行步数。步数越多，能完成的任务越复杂，但消耗的 token 也越多。选「不限制」就交给模型自己判断什么时候结束。",
                     fontSize = 14.sp,
                     color = colors.textSecondary,
                     modifier = Modifier.padding(bottom = 16.dp)
@@ -1466,7 +1869,7 @@ fun MaxStepsDialog(
 
                 // 当前值显示
                 Text(
-                    text = "${steps.toInt()} 步",
+                    text = if (unlimited) "不限制" else "${steps.toInt()} 步",
                     fontSize = 24.sp,
                     fontWeight = FontWeight.Bold,
                     color = colors.primary,
@@ -1476,16 +1879,60 @@ fun MaxStepsDialog(
                     textAlign = androidx.compose.ui.text.style.TextAlign.Center
                 )
 
+                // 不限制开关
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clickable { unlimited = !unlimited },
+                    shape = RoundedCornerShape(10.dp),
+                    color = if (unlimited) colors.primary.copy(alpha = 0.12f) else colors.backgroundInput
+                ) {
+                    Row(
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "不限制",
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                                color = if (unlimited) colors.primary else colors.textPrimary
+                            )
+                            Text(
+                                text = "一直执行到任务完成（注意 token 消耗）",
+                                fontSize = 11.sp,
+                                color = colors.textHint
+                            )
+                        }
+                        Switch(
+                            checked = unlimited,
+                            onCheckedChange = { unlimited = it },
+                            colors = SwitchDefaults.colors(
+                                checkedThumbColor = colors.primary,
+                                checkedTrackColor = colors.primary.copy(alpha = 0.5f),
+                                uncheckedThumbColor = colors.textHint,
+                                uncheckedTrackColor = colors.backgroundInput
+                            )
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(12.dp))
+
                 // 滑块
                 Slider(
                     value = steps,
                     onValueChange = { steps = it },
                     valueRange = 5f..100f,
                     steps = 18, // (100-5)/5 - 1 = 18 个刻度点，每 5 步一个
+                    enabled = !unlimited,
                     colors = SliderDefaults.colors(
                         thumbColor = colors.primary,
                         activeTrackColor = colors.primary,
-                        inactiveTrackColor = colors.backgroundInput
+                        inactiveTrackColor = colors.backgroundInput,
+                        disabledThumbColor = colors.textHint,
+                        disabledActiveTrackColor = colors.textHint.copy(alpha = 0.4f),
+                        disabledInactiveTrackColor = colors.backgroundInput
                     ),
                     modifier = Modifier.fillMaxWidth()
                 )
@@ -1514,18 +1961,26 @@ fun MaxStepsDialog(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    listOf(15, 25, 50).forEach { preset ->
+                    presets.forEach { preset ->
+                        val selected = if (preset == 0) unlimited else (!unlimited && steps.toInt() == preset)
                         Surface(
                             modifier = Modifier
                                 .weight(1f)
-                                .clickable { steps = preset.toFloat() },
+                                .clickable {
+                                    if (preset == 0) {
+                                        unlimited = true
+                                    } else {
+                                        unlimited = false
+                                        steps = preset.toFloat()
+                                    }
+                                },
                             shape = RoundedCornerShape(8.dp),
-                            color = if (steps.toInt() == preset) colors.primary else colors.backgroundInput
+                            color = if (selected) colors.primary else colors.backgroundInput
                         ) {
                             Text(
-                                text = "$preset",
-                                fontSize = 14.sp,
-                                color = if (steps.toInt() == preset) Color.White else colors.textSecondary,
+                                text = if (preset == 0) "不限制" else "$preset",
+                                fontSize = 13.sp,
+                                color = if (selected) Color.White else colors.textSecondary,
                                 modifier = Modifier.padding(vertical = 8.dp),
                                 textAlign = androidx.compose.ui.text.style.TextAlign.Center
                             )
@@ -1535,7 +1990,7 @@ fun MaxStepsDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = { onConfirm(steps.toInt()) }) {
+            TextButton(onClick = { onConfirm(if (unlimited) 0 else steps.toInt()) }) {
                 Text("确定", color = colors.primary)
             }
         },
@@ -1713,24 +2168,26 @@ fun RootModeWarningDialog(
         text = {
             Column {
                 Text(
-                    text = "Root 模式将允许应用使用更高级的系统权限。",
+                    text = "Root 模式 = 在 Magisk / KernelSU 这类 Root 管理器里给「豆糕」授权，\n" +
+                            "豆糕就拿到了 root 身份，可以**直接操作手机**（点按、滑动、截屏），\n" +
+                            "不需要 Shizuku，也不需要无障碍。",
                     fontSize = 14.sp,
                     color = colors.textPrimary,
                     modifier = Modifier.padding(bottom = 12.dp)
                 )
                 Text(
-                    text = "警告：",
+                    text = "注意：",
                     fontSize = 14.sp,
                     fontWeight = FontWeight.Bold,
                     color = colors.error
                 )
                 Spacer(modifier = Modifier.height(8.dp))
-                BulletPoint("Root 权限可能导致系统不稳定")
-                BulletPoint("不当操作可能损坏设备数据")
-                BulletPoint("请确保您了解 Root 权限的风险")
+                BulletPoint("首次开启时，Root 管理器会弹窗问你要不要授权，选「允许」")
+                BulletPoint("没弹窗 / 没授权的话，Root 模式实际上不会生效")
+                BulletPoint("Root 权限很强，请只在你自己的设备上使用")
                 Spacer(modifier = Modifier.height(12.dp))
                 Text(
-                    text = "仅在您完全了解风险并需要高级功能时才启用此选项。",
+                    text = "已经授权过了？直接开启即可。",
                     fontSize = 13.sp,
                     color = colors.textSecondary
                 )

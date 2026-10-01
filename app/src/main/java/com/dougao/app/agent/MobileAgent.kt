@@ -49,7 +49,22 @@ class MobileAgent(
     private val controller: DeviceController,
     private val context: Context,
     private val guiOwlClient: GUIOwlClient? = null,
-    private val maiuiClient: MAIUIClient? = null
+    private val maiuiClient: MAIUIClient? = null,
+    /**
+     * 极速模式（豆糕 1.2.1）：
+     *  - 动作后的等待时间减半（界面稳定一般比这快）；
+     *  - 上下文只带最近 5 轮，模型要读的东西更少；
+     *  - 截图前后隐藏悬浮窗的等待缩短。
+     */
+    private val speedMode: Boolean = false,
+    /**
+     * 这个任务房间之前的对话（role to text），豆糕 1.3.0 新增。
+     *
+     * 用途：AI 做错了 → 用户点叉号停掉 → 再说一句「不是这个，应该点右边」，
+     * 这时需要把前面「用户要求过什么、AI 做过什么」一并喂给模型，
+     * 它才知道自己错在哪、要改什么。不传就是全新任务。
+     */
+    private val priorContext: List<Pair<String, String>> = emptyList()
 ) {
     private val useGUIOwlMode: Boolean = guiOwlClient != null
     private val useMAIUIMode: Boolean = maiuiClient != null
@@ -77,7 +92,28 @@ class MobileAgent(
 
         /** 上下文里最多保留多少轮对话（system 之外） */
         private const val MAX_HISTORY_TURNS = 8
+
+        /** 极速模式下的上下文轮数 */
+        private const val MAX_HISTORY_TURNS_FAST = 5
+
+        /**
+         * 完全相同的动作连续做这么多次，就认为模型可能在「任务已经做完了还在原地打转」，
+         * 或者彻底卡死了 —— 推它一把，要么收尾要么换招（豆糕 1.3.1）。
+         */
+        private const val MAX_REPEAT_ACTIONS = 3
     }
+
+    private val maxHistoryTurns: Int
+        get() = when {
+            // 带历史（纠错续跑）时要多留一些，不然模型会忘了前面错在哪
+            priorContext.isNotEmpty() -> if (speedMode) 10 else 16
+            speedMode -> MAX_HISTORY_TURNS_FAST
+            else -> MAX_HISTORY_TURNS
+        }
+
+    /** 截图前后给系统留的时间（隐藏悬浮窗 -> 截图 -> 恢复） */
+    private val shotSettleMs: Long
+        get() = if (speedMode) 25L else 60L
 
     // ==================================================================
     // 入口
@@ -121,8 +157,8 @@ class MobileAgent(
         cachedScreenshot = null
         consecutiveShotFailures = 0
 
-        // ---- 屏幕尺寸 ----
-        val (screenWidth, screenHeight) = controller.getScreenSize()
+        // ---- 屏幕尺寸（放 IO 线程，避免主线程被 shell 卡住）----
+        val (screenWidth, screenHeight) = withContext(Dispatchers.IO) { controller.getScreenSize() }
         log("屏幕尺寸：${screenWidth}x${screenHeight}")
 
         // ---- 已安装应用（让模型 Launch 时用对名字）----
@@ -143,8 +179,25 @@ class MobileAgent(
             put("content", AutoGlmProtocol.buildSystemPrompt(installedApps))
         })
 
-        // ---- 悬浮窗 ----
-        OverlayService.show(context, "准备开始…") { stopInternal() }
+        // ---- 把同一个任务房间之前说过的话接上（豆糕 1.3.0：纠错续跑）----
+        if (priorContext.isNotEmpty()) {
+            log("已带入本任务之前的 ${priorContext.size} 条对话记录")
+            priorContext.forEach { (role, text) ->
+                if (text.isBlank()) return@forEach
+                // 只允许 user / assistant，避免历史里混进 system 把规矩冲掉
+                val safeRole = if (role == "assistant") "assistant" else "user"
+                messages.put(JSONObject().apply {
+                    put("role", safeRole)
+                    put("content", text)
+                })
+            }
+        }
+
+        // ---- 悬浮窗（豆糕 1.3.1）----
+        // 悬浮窗上固定显示「任务名字」，不随每一步跳动（以前会变成"点击 xxx"，看不清是哪个任务）；
+        // 「执行中：」/「后台执行中：」前缀由 OverlayService 自己加。
+        val overlayTaskText = instruction.trim().take(24)
+        OverlayService.show(context, overlayTaskText) { stopInternal() }
 
         var step = 0
         var successActions = 0
@@ -152,6 +205,9 @@ class MobileAgent(
         var lastFailureReason: String? = null
         // 纠错提示：合并进下一条 user 消息，避免出现连续两条 user（部分接口会拒绝）
         var pendingHint: String? = null
+        // 重复动作保护（豆糕 1.3.1）
+        var lastActionSig: String? = null
+        var repeatActionCount = 0
 
         try {
             while (step < maxSteps) {
@@ -163,7 +219,7 @@ class MobileAgent(
                 step++
                 _state.value = _state.value.copy(currentStep = step, phase = AgentPhase.RUNNING)
                 log("\n──── 第 $step 步 ────")
-                OverlayService.update("执行中 $step/$maxSteps")
+                OverlayService.update(overlayTaskText)
 
                 // ---------- 1. 拿画面 ----------
                 val shot = obtainScreenshot()
@@ -205,7 +261,14 @@ class MobileAgent(
 
                 // ---------- 3. 组装本轮 user 消息（先图后文） ----------
                 val baseText = if (step == 1) {
-                    "$instruction\n\n** 屏幕信息 **\n$screenInfo"
+                    val head = if (priorContext.isNotEmpty()) {
+                        "【这是同一个任务的后续要求】\n" +
+                                "请先看上面这个任务已经发生过的对话：如果之前做错了，说明错在哪、这次怎么改；\n" +
+                                "然后按下面这条最新要求继续操作。\n\n$instruction"
+                    } else {
+                        instruction
+                    }
+                    "$head\n\n** 屏幕信息 **\n$screenInfo"
                 } else {
                     "** 屏幕信息 **\n$screenInfo"
                 }
@@ -226,7 +289,7 @@ class MobileAgent(
                     // 把这轮 user 消息撤掉，下一步重新组装
                     messages.remove(messages.length() - 1)
                     lastFailureReason = err
-                    delay(800)
+                    if (!speedMode) delay(800)
                     step--
                     continue
                 }
@@ -254,7 +317,7 @@ class MobileAgent(
                             "<answer>do(action=\"Tap\", element=[500, 300])</answer>\n" +
                             "如果要结束，用 <answer>finish(message=\"...\")</answer>"
                     step--
-                    delay(200)
+                    if (!speedMode) delay(200)
                     continue
                 }
 
@@ -290,7 +353,6 @@ class MobileAgent(
                 )
                 _state.value = _state.value.copy(executionSteps = _state.value.executionSteps + runningStep)
                 log("🔧 $display")
-                OverlayService.update(display)
 
                 val needConfirm = action.str("message") != null &&
                         action.name.equals("Tap", ignoreCase = true)
@@ -324,6 +386,25 @@ class MobileAgent(
                 cachedScreenshot = null   // 动作后画面变了，不能用旧图
                 val after = takeScreenshotQuiet()
                 if (after != null) cachedScreenshot = after
+
+                // ---------- 10. 重复动作保护（豆糕 1.3.1）----------
+                // 模型常见的两种毛病：任务其实已经做完了还在原地反复点；或者彻底卡死了。
+                // 出现「完全一样」的动作连续 N 次，就提醒它：该收尾就收尾，不该收尾就换招。
+                val actionSig = "${action.name}|" + action.params.entries
+                    .sortedBy { it.key }
+                    .joinToString(",") { "${it.key}=${it.value}" }
+                if (actionSig == lastActionSig) {
+                    repeatActionCount++
+                } else {
+                    lastActionSig = actionSig
+                    repeatActionCount = 1
+                }
+                if (repeatActionCount == MAX_REPEAT_ACTIONS) {
+                    log("⚠️ 连续 $repeatActionCount 次做了完全相同的动作，提醒模型该收尾了")
+                    pendingHint = "你已经连续 $repeatActionCount 次执行了完全相同的动作，情况没有任何变化。\n" +
+                            "请判断：如果用户要你办的事已经办成了，请立刻 finish，并把结果完整总结在 message 里；\n" +
+                            "如果确实还没完成，请换一种不同的做法，不要重复同一个动作。"
+                }
             }
 
             // 循环正常结束 = 步数用完了
@@ -335,6 +416,9 @@ class MobileAgent(
 
         } catch (e: CancellationException) {
             log("任务被取消")
+            // 豆糕 1.3.2：取消 / 被强杀时也要把状态复位，
+            // 否则界面会永远停在「执行中」，看起来像关了还在转。
+            _state.value = _state.value.copy(isRunning = false, phase = AgentPhase.IDLE)
             cleanup()
             throw e
         } catch (e: Exception) {
@@ -360,7 +444,7 @@ class MobileAgent(
         }
 
         OverlayService.setVisible(false)
-        delay(60)
+        delay(shotSettleMs)
         val result = controller.screenshotWithFallback()
         OverlayService.setVisible(true)
 
@@ -376,7 +460,7 @@ class MobileAgent(
     private suspend fun takeScreenshotQuiet(): Bitmap? {
         return try {
             OverlayService.setVisible(false)
-            delay(60)
+            delay(shotSettleMs)
             val r = controller.screenshotWithFallback()
             OverlayService.setVisible(true)
             if (r.isFallback) null else r.bitmap
@@ -439,7 +523,7 @@ class MobileAgent(
         val system = messages.optJSONObject(0)
         val nonSystem = messages.length() - 1
         // 一轮 = user + assistant，所以是 2 倍
-        val maxNonSystem = MAX_HISTORY_TURNS * 2
+        val maxNonSystem = maxHistoryTurns * 2
         if (nonSystem <= maxNonSystem) return
 
         val drop = nonSystem - maxNonSystem
@@ -546,19 +630,21 @@ class MobileAgent(
      *
      * 旧版是"第一步死等 5 秒、之后每步死等 2 秒"，不管什么动作都一样。
      * 这里按动作类型区分（参考 Aries-AI 的实测参数）。
+     * 极速模式下整体再收紧一档 —— 因为后面紧接着还要截一次图，
+     * 那一步本身也要花两三百毫秒，实际留给界面加载的时间并不少。
      */
     private fun settleDelay(actionName: String?, step: Int): Long {
         val base = when (actionName?.lowercase()?.replace(" ", "")) {
-            "launch" -> 1200L
+            "launch" -> if (speedMode) 900L else 1200L
             "wait" -> 0L
-            "type", "typename" -> 400L
-            "swipe" -> 500L
-            "tap", "doubletap", "longpress" -> 600L
-            "back", "home" -> 500L
+            "type", "typename" -> if (speedMode) 250L else 400L
+            "swipe" -> if (speedMode) 350L else 500L
+            "tap", "doubletap", "longpress" -> if (speedMode) 400L else 600L
+            "back", "home" -> if (speedMode) 350L else 500L
             "take_over", "takeover", "interact" -> 300L
-            else -> 500L
+            else -> if (speedMode) 350L else 500L
         }
-        return if (step == 1) maxOf(base, 1000L) else base
+        return if (step == 1) maxOf(base, if (speedMode) 900L else 1000L) else base
     }
 
     // ==================================================================
@@ -621,9 +707,21 @@ class MobileAgent(
     // GUI-Owl / MAI-UI 模式（保留，走各自的单次调用协议）
     // ==================================================================
 
+    /**
+     * 给不支持多轮消息的通道（GUI-Owl / MAI-UI）用的：把历史拼成一段文字放在指令前面。
+     */
+    private fun withPrior(instruction: String): String {
+        if (priorContext.isEmpty()) return instruction
+        val history = priorContext.joinToString("\n") { (role, text) ->
+            "${if (role == "assistant") "AI" else "用户"}：$text"
+        }
+        return "【本任务之前的对话】\n$history\n\n【用户最新要求】\n$instruction"
+    }
+
     private suspend fun runInstructionWithGUIOwl(instruction: String, maxSteps: Int): AgentResult {
         val client = guiOwlClient ?: return AgentResult(false, "GUI-Owl 客户端未初始化")
         client.resetSession()
+        val effectiveInstruction = withPrior(instruction)
 
         val (sw, sh) = controller.getScreenSize()
         _logs.value = emptyList()
@@ -637,7 +735,7 @@ class MobileAgent(
                 _state.value = _state.value.copy(currentStep = step)
 
                 val shot = obtainScreenshot() ?: continue
-                val response = client.predict(instruction, shot)
+                val response = client.predict(effectiveInstruction, shot)
                 if (response.isFailure) continue
 
                 val result = response.getOrThrow()
@@ -662,6 +760,7 @@ class MobileAgent(
             }
             return finishWith(false, "达到最大步数限制")
         } catch (e: CancellationException) {
+            _state.value = _state.value.copy(isRunning = false, phase = AgentPhase.IDLE)
             cleanup()
             throw e
         }
@@ -700,6 +799,7 @@ class MobileAgent(
     private suspend fun runInstructionWithMAIUI(instruction: String, maxSteps: Int): AgentResult {
         val client = maiuiClient ?: return AgentResult(false, "MAI-UI 客户端未初始化")
         client.reset()
+        val effectiveInstruction = withPrior(instruction)
 
         val (sw, sh) = controller.getScreenSize()
         client.setAvailableApps(appScanner.getApps().map { it.appName })
@@ -715,7 +815,7 @@ class MobileAgent(
                 _state.value = _state.value.copy(currentStep = step)
 
                 val shot = obtainScreenshot() ?: continue
-                val response = client.predict(instruction, shot)
+                val response = client.predict(effectiveInstruction, shot)
                 if (response.isFailure) continue
 
                 val result = response.getOrThrow()
@@ -746,6 +846,7 @@ class MobileAgent(
             }
             return finishWith(false, "达到最大步数限制")
         } catch (e: CancellationException) {
+            _state.value = _state.value.copy(isRunning = false, phase = AgentPhase.IDLE)
             cleanup()
             throw e
         }

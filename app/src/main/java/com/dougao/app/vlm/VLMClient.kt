@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.util.Base64
 import com.dougao.app.data.ThinkingLevel
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.ConnectionPool
@@ -16,6 +17,7 @@ import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.net.UnknownHostException
 import java.util.concurrent.TimeUnit
+import kotlin.coroutines.coroutineContext
 
 /**
  * VLM (Vision Language Model) API 客户端
@@ -29,12 +31,21 @@ class VLMClient(
     private val apiKey: String,
     baseUrl: String = "https://api.openai.com/v1",
     private val model: String = "gpt-4-vision-preview",
-    private val thinkingLevel: Int = ThinkingLevel.MEDIUM.level
+    private val thinkingLevel: Int = ThinkingLevel.MEDIUM.level,
+    /**
+     * 极速模式（豆糕 1.2.1）：强制关闭深度思考链，并把单次输出上限收窄。
+     *
+     * 实测这是"慢"的最大来源 —— 开着思考链时，模型每走一步都要先生成
+     * 上千个推理 token 才吐出动作，一步要几十秒；关掉之后 1~2 秒就能出动作。
+     */
+    private val speedMode: Boolean = false
 ) {
     // 规范化 URL：自动添加 https:// 前缀，移除末尾斜杠
     private val baseUrl: String = normalizeUrl(baseUrl)
 
-    private val currentLevel: ThinkingLevel = ThinkingLevel.fromLevel(thinkingLevel)
+    /** 极速模式下不再走"深思考"，直接用最低档（等价于关闭思考链） */
+    private val currentLevel: ThinkingLevel =
+        if (speedMode) ThinkingLevel.LOW else ThinkingLevel.fromLevel(thinkingLevel)
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -119,6 +130,8 @@ class VLMClient(
     // ------------------------------------------------------------------
 
     private fun maxTokensFor(level: ThinkingLevel): Int = when (level) {
+        // 说明：max_tokens 只是"上限"，本身不加速；设太小反而会把动作截断，
+        // 白白浪费一轮往返。真正的提速靠"关掉思考链"。
         ThinkingLevel.LOW -> 2048
         ThinkingLevel.MEDIUM -> 4096
         ThinkingLevel.HIGH -> 8192
@@ -135,8 +148,14 @@ class VLMClient(
 
         // 通义千问 Qwen3 系列（含 qwen3-vl）
         if (m.contains("qwen3") || m.contains("qwq")) {
+            // 关思考时只发 enable_thinking=false —— 部分网关对
+            // "关思考 + 带 thinking_budget" 的组合会报 400，
+            // 一报 400 就会退到"最小请求体"，反而把思考又打开了。
+            if (level == ThinkingLevel.LOW) {
+                return mapOf("enable_thinking" to false)
+            }
             return mapOf(
-                "enable_thinking" to (level != ThinkingLevel.LOW),
+                "enable_thinking" to true,
                 "thinking_budget" to when (level) {
                     ThinkingLevel.LOW -> 512
                     ThinkingLevel.MEDIUM -> 2048
@@ -178,7 +197,7 @@ class VLMClient(
 
         if (!rich) {
             // 兜底：几乎所有 OpenAI 兼容服务都接受的最小请求体
-            body.put("max_tokens", 4096)
+            body.put("max_tokens", if (speedMode) 1024 else 4096)
             return body
         }
 
@@ -231,37 +250,47 @@ class VLMClient(
                     .build()
 
                 var shouldReturn = false
-                client.newCall(request).execute().use { response ->
-                    val responseBody = response.body?.string() ?: ""
+                val call = client.newCall(request)
 
-                    if (response.isSuccessful) {
-                        return@withContext parseContent(responseBody)
+                // 协程被取消时（用户点了「停止」）顺手把这次 HTTP 请求掐掉。
+                // 否则 OkHttp 的 execute() 是阻塞的，最长会傻等 readTimeout（180 秒），
+                // 期间「停止」按下去像没反应一样。
+                val cancelHook = coroutineContext[Job]?.invokeOnCompletion { call.cancel() }
+                try {
+                    call.execute().use { response ->
+                        val responseBody = response.body?.string() ?: ""
+
+                        if (response.isSuccessful) {
+                            return@withContext parseContent(responseBody)
+                        }
+
+                        lastException = Exception(friendlyError(response.code, responseBody))
+
+                        when {
+                            // 参数不支持 -> 降级为最小请求体，马上重试
+                            (response.code == 400 || response.code == 422) && rich -> {
+                                println("[VLMClient] HTTP ${response.code}，改用最小参数重试")
+                                rich = false
+                                waitBeforeNext = 0
+                            }
+
+                            // 限流：多等一会儿
+                            response.code == 429 -> {
+                                waitBeforeNext = 2000L * attempt
+                                println("[VLMClient] HTTP 429 被限流，${waitBeforeNext}ms 后重试")
+                            }
+
+                            // 上游网关抖动：退避重试
+                            response.code in 500..599 -> {
+                                println("[VLMClient] HTTP ${response.code} 服务端异常，${waitBeforeNext}ms 后重试")
+                            }
+
+                            // Key / 地址 / 权限问题，重试无意义
+                            else -> shouldReturn = true
+                        }
                     }
-
-                    lastException = Exception(friendlyError(response.code, responseBody))
-
-                    when {
-                        // 参数不支持 -> 降级为最小请求体，马上重试
-                        (response.code == 400 || response.code == 422) && rich -> {
-                            println("[VLMClient] HTTP ${response.code}，改用最小参数重试")
-                            rich = false
-                            waitBeforeNext = 0
-                        }
-
-                        // 限流：多等一会儿
-                        response.code == 429 -> {
-                            waitBeforeNext = 2000L * attempt
-                            println("[VLMClient] HTTP 429 被限流，${waitBeforeNext}ms 后重试")
-                        }
-
-                        // 上游网关抖动：退避重试
-                        response.code in 500..599 -> {
-                            println("[VLMClient] HTTP ${response.code} 服务端异常，${waitBeforeNext}ms 后重试")
-                        }
-
-                        // Key / 地址 / 权限问题，重试无意义
-                        else -> shouldReturn = true
-                    }
+                } finally {
+                    cancelHook?.dispose()
                 }
                 if (shouldReturn) return@withContext Result.failure(lastException!!)
 

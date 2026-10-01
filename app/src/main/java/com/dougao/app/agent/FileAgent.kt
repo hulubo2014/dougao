@@ -47,6 +47,9 @@ class FileAgent(
 
     fun stop() {
         stopped = true
+        // 立刻把「运行中」放掉：等模型回包可能要好几秒，
+        // 不先改状态的话，用户点了停止按钮界面毫无反应，会以为按钮坏了。
+        _state.value = _state.value.copy(isRunning = false)
     }
 
     fun resolveConfirm(approved: Boolean) {
@@ -69,7 +72,23 @@ class FileAgent(
 
     // ------------------------------------------------------------------
 
-    suspend fun run(instruction: String, maxSteps: Int = 20): AgentResult = withContext(Dispatchers.IO) {
+    /**
+     * 对外入口。
+     *
+     * 外面套一层 try/finally：不管是正常跑完、模型报错，还是用户中途按了停止
+     * （协程被 cancel，`withContext` 会直接抛 CancellationException），
+     * **都必须把 isRunning 置回 false** —— 否则右下角会永远卡在红色的停止按钮上，
+     * 再点也没反应。
+     */
+    suspend fun run(instruction: String, maxSteps: Int = 20): AgentResult {
+        return try {
+            runInternal(instruction, maxSteps)
+        } finally {
+            _state.value = _state.value.copy(isRunning = false)
+        }
+    }
+
+    private suspend fun runInternal(instruction: String, maxSteps: Int = 20): AgentResult = withContext(Dispatchers.IO) {
         stopped = false
         _logs.value = emptyList()
         val startedAt = System.currentTimeMillis()

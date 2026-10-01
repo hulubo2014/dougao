@@ -38,6 +38,9 @@ class OverlayService : Service() {
     private var divider2: View? = null  // 确认模式下第二个分隔线
     private var animator: ValueAnimator? = null
 
+    /** 当前任务的短名字（悬浮窗上显示的那一行） */
+    private var taskName: String = "豆糕"
+
     companion object {
         private var instance: OverlayService? = null
         private var stopCallback: (() -> Unit)? = null
@@ -207,9 +210,16 @@ class OverlayService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        val text = intent?.getStringExtra("text") ?: "豆糕"
+        // 豆糕 1.3.2：系统把服务拉起来时 intent 是 null（重启），
+        // 这时根本没有任何任务在跑，绝不能再把悬浮窗挂回屏幕上。
+        if (intent == null) {
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        val text = intent.getStringExtra("text") ?: "豆糕"
         updateText(text)
-        return START_STICKY
+        // 不用 START_STICKY：任务结束就该结束，不应该被系统复活
+        return START_NOT_STICKY
     }
 
     override fun onDestroy() {
@@ -452,9 +462,13 @@ class OverlayService : Service() {
     }
 
     private fun updateText(text: String) {
-        textView?.post {
-            textView?.text = text
-        }
+        taskName = text
+        textView?.post { refreshTaskLabel() }
+    }
+
+    /** 刷新任务名那一行：固定显示「执行中：任务名」 */
+    private fun refreshTaskLabel() {
+        textView?.text = "执行中：$taskName"
     }
 
     /** 切换到人机协作模式 */
@@ -481,6 +495,8 @@ class OverlayService : Service() {
             // 隐藏取消按钮和第二分隔线
             divider2?.visibility = View.GONE
             cancelButton?.visibility = View.GONE
+            // 恢复任务名
+            refreshTaskLabel()
         }
     }
 
