@@ -1,0 +1,21 @@
+# 统一换行符：仓库内一律 LF，Windows 批处理保留 CRLF
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制文件（不要做换行转换）
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.jar binary
+*.jks binary
+*.keystore binary
+*.apk binary
+*.zip binary
+
+# Gradle wrapper 脚本必须保留
+gradlew text eol=lf
+gradlew.bat text eol=crlf
